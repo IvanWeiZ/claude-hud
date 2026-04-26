@@ -1,11 +1,11 @@
-import { DEFAULT_ELEMENT_ORDER } from '../config.js';
+import { DEFAULT_ELEMENT_ORDER, DEFAULT_MERGE_GROUPS } from '../config.js';
 import { renderSessionLine } from './session-line.js';
 import { renderToolsLine } from './tools-line.js';
 import { renderAgentsLine } from './agents-line.js';
 import { renderTodosLine } from './todos-line.js';
-import { renderIdentityLine, renderProjectLine, renderGitFilesLine, renderEnvironmentLine, renderUsageLine, renderMemoryLine, renderSessionTokensLine, } from './lines/index.js';
+import { renderIdentityLine, renderProjectLine, renderGitFilesLine, renderEnvironmentLine, renderPromptCacheLine, renderUsageLine, renderMemoryLine, renderSessionTokensLine, } from './lines/index.js';
 import { dim, RESET } from './colors.js';
-import { UNKNOWN_TERMINAL_WIDTH } from '../utils/terminal.js';
+import { getTerminalWidth, UNKNOWN_TERMINAL_WIDTH } from '../utils/terminal.js';
 // eslint-disable-next-line no-control-regex
 const ANSI_ESCAPE_PATTERN = /^(?:\x1b\[[0-9;]*m|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\))/;
 // eslint-disable-next-line no-control-regex
@@ -15,23 +15,6 @@ const GRAPHEME_SEGMENTER = typeof Intl.Segmenter === 'function'
     : null;
 function stripAnsi(str) {
     return str.replace(ANSI_ESCAPE_GLOBAL, '');
-}
-function getTerminalWidth() {
-    const stdoutColumns = process.stdout?.columns;
-    if (typeof stdoutColumns === 'number' && Number.isFinite(stdoutColumns) && stdoutColumns > 0) {
-        return Math.floor(stdoutColumns);
-    }
-    // When running as a statusline subprocess, stdout is piped but stderr is
-    // still connected to the real terminal — use it to get the actual width.
-    const stderrColumns = process.stderr?.columns;
-    if (typeof stderrColumns === 'number' && Number.isFinite(stderrColumns) && stderrColumns > 0) {
-        return Math.floor(stderrColumns);
-    }
-    const envColumns = Number.parseInt(process.env.COLUMNS ?? '', 10);
-    if (Number.isFinite(envColumns) && envColumns > 0) {
-        return envColumns;
-    }
-    return UNKNOWN_TERMINAL_WIDTH;
 }
 function splitAnsiTokens(str) {
     const tokens = [];
@@ -254,6 +237,29 @@ function makeSeparator(length) {
     return dim('─'.repeat(Math.max(length, 1)));
 }
 const ACTIVITY_ELEMENTS = new Set(['tools', 'agents', 'todos']);
+function buildMergeGroupLookup(mergeGroups) {
+    const lookup = new Map();
+    for (const group of mergeGroups) {
+        const groupSet = new Set(group);
+        for (const element of group) {
+            if (!lookup.has(element)) {
+                lookup.set(element, groupSet);
+            }
+        }
+    }
+    return lookup;
+}
+function collectMergeSequence(elementOrder, startIndex, seen, group) {
+    const sequence = [];
+    for (let index = startIndex; index < elementOrder.length; index += 1) {
+        const element = elementOrder[index];
+        if (seen.has(element) || !group.has(element)) {
+            break;
+        }
+        sequence.push(element);
+    }
+    return sequence;
+}
 function collectActivityLines(ctx) {
     const activityLines = [];
     const display = ctx.config?.display;
@@ -277,15 +283,18 @@ function collectActivityLines(ctx) {
     }
     return activityLines;
 }
-function renderElementLine(ctx, element) {
+function renderElementLine(ctx, element, options) {
     const display = ctx.config?.display;
+    const alignProgressLabels = options?.alignProgressLabels ?? false;
     switch (element) {
         case 'project':
             return renderProjectLine(ctx);
         case 'context':
-            return renderIdentityLine(ctx);
+            return renderIdentityLine(ctx, alignProgressLabels);
         case 'usage':
-            return renderUsageLine(ctx);
+            return renderUsageLine(ctx, alignProgressLabels);
+        case 'promptCache':
+            return renderPromptCacheLine(ctx);
         case 'memory':
             return renderMemoryLine(ctx);
         case 'environment':
@@ -308,6 +317,8 @@ function renderCompact(ctx) {
 }
 function renderExpanded(ctx, terminalWidth = null) {
     const elementOrder = ctx.config?.elementOrder ?? DEFAULT_ELEMENT_ORDER;
+    const mergeGroups = ctx.config?.display?.mergeGroups ?? DEFAULT_MERGE_GROUPS;
+    const mergeGroupLookup = buildMergeGroupLookup(mergeGroups);
     const seen = new Set();
     const lines = [];
     for (let index = 0; index < elementOrder.length; index += 1) {
@@ -315,31 +326,51 @@ function renderExpanded(ctx, terminalWidth = null) {
         if (seen.has(element)) {
             continue;
         }
-        const nextElement = elementOrder[index + 1];
-        if ((element === 'context' && nextElement === 'usage' && !seen.has('usage'))
-            || (element === 'usage' && nextElement === 'context' && !seen.has('context'))) {
-            seen.add(element);
-            seen.add(nextElement);
-            const firstLine = renderElementLine(ctx, element);
-            const secondLine = renderElementLine(ctx, nextElement);
-            if (firstLine && secondLine) {
-                const combinedLine = `${firstLine} │ ${secondLine}`;
-                const canCombine = !terminalWidth || visualLength(combinedLine) <= terminalWidth;
-                if (canCombine) {
-                    lines.push({ line: combinedLine, isActivity: false });
+        const mergeGroup = mergeGroupLookup.get(element);
+        if (mergeGroup) {
+            const mergeSequence = collectMergeSequence(elementOrder, index, seen, mergeGroup);
+            if (mergeSequence.length > 1) {
+                index += mergeSequence.length - 1;
+                for (const groupedElement of mergeSequence) {
+                    seen.add(groupedElement);
                 }
-                else {
-                    lines.push({ line: firstLine, isActivity: false });
-                    lines.push({ line: secondLine, isActivity: false });
+                const renderedGroupLines = mergeSequence
+                    .map(groupedElement => ({
+                    element: groupedElement,
+                    line: renderElementLine(ctx, groupedElement),
+                }))
+                    .filter((entry) => typeof entry.line === 'string' && entry.line.length > 0);
+                if (renderedGroupLines.length > 1) {
+                    const combinedLine = renderedGroupLines.map(({ line }) => line).join(' │ ');
+                    const widthIsReal = terminalWidth !== UNKNOWN_TERMINAL_WIDTH;
+                    const canCombine = !widthIsReal || visualLength(combinedLine) <= terminalWidth;
+                    if (canCombine) {
+                        lines.push({
+                            line: combinedLine,
+                            isActivity: renderedGroupLines.some(({ element: groupedElement }) => ACTIVITY_ELEMENTS.has(groupedElement)),
+                        });
+                    }
+                    else {
+                        for (const { element: groupedElement, line } of renderedGroupLines) {
+                            const stackedLine = renderElementLine(ctx, groupedElement, {
+                                alignProgressLabels: true,
+                            }) ?? line;
+                            lines.push({
+                                line: stackedLine,
+                                isActivity: ACTIVITY_ELEMENTS.has(groupedElement),
+                            });
+                        }
+                    }
                 }
+                else if (renderedGroupLines.length === 1) {
+                    const [{ element: groupedElement, line }] = renderedGroupLines;
+                    lines.push({
+                        line,
+                        isActivity: ACTIVITY_ELEMENTS.has(groupedElement),
+                    });
+                }
+                continue;
             }
-            else if (firstLine) {
-                lines.push({ line: firstLine, isActivity: false });
-            }
-            else if (secondLine) {
-                lines.push({ line: secondLine, isActivity: false });
-            }
-            continue;
         }
         seen.add(element);
         const line = renderElementLine(ctx, element);
@@ -361,7 +392,8 @@ function renderExpanded(ctx, terminalWidth = null) {
 export function render(ctx) {
     const lineLayout = ctx.config?.lineLayout ?? 'expanded';
     const showSeparators = ctx.config?.showSeparators ?? false;
-    const terminalWidth = getTerminalWidth();
+    const detectedWidth = getTerminalWidth({ preferEnv: true, fallback: UNKNOWN_TERMINAL_WIDTH });
+    const terminalWidth = detectedWidth ?? ctx.config?.maxWidth ?? UNKNOWN_TERMINAL_WIDTH;
     let lines;
     if (lineLayout === 'expanded') {
         const renderedLines = renderExpanded(ctx, terminalWidth);
@@ -398,7 +430,11 @@ export function render(ctx) {
         lines.push(...activityLines);
     }
     const physicalLines = lines.flatMap(line => line.split('\n'));
-    const visibleLines = physicalLines.flatMap(line => wrapLineToWidth(line, terminalWidth));
+    // Only wrap when terminal width is real (known). When width is the
+    // UNKNOWN_TERMINAL_WIDTH fallback, wrapping would use an arbitrary value
+    // and produce incorrect line breaks.
+    const wrapWidth = terminalWidth !== UNKNOWN_TERMINAL_WIDTH ? (terminalWidth ?? 0) : 0;
+    const visibleLines = physicalLines.flatMap(line => wrapLineToWidth(line, wrapWidth));
     for (const line of visibleLines) {
         const outputLine = `${RESET}${line}`;
         console.log(outputLine);

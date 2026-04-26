@@ -9,7 +9,7 @@ const defaultExecFile = promisify(execFile);
 let execFileImpl = defaultExecFile;
 let resolveClaudeBinaryImpl = resolveClaudeBinaryFromPath;
 let platformImpl = () => process.platform;
-let comspecImpl = () => process.env.COMSPEC;
+let windowsCmdImpl = () => 'C:\\Windows\\System32\\cmd.exe';
 let cachedBinaryKey;
 let cachedVersion;
 let hasResolved = false;
@@ -51,7 +51,9 @@ function readVersionCache(homeDir) {
             return null;
         }
         const parsed = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
-        if (typeof parsed.binaryPath !== 'string'
+        if ((parsed.resolvedFromPath !== undefined && typeof parsed.resolvedFromPath !== 'string')
+            ||
+                typeof parsed.binaryPath !== 'string'
             || typeof parsed.binaryMtimeMs !== 'number'
             || (typeof parsed.version !== 'string' && parsed.version !== null)) {
             return null;
@@ -137,12 +139,12 @@ export function _parseClaudeCodeVersion(output) {
     const match = trimmed.match(/\d+(?:\.\d+)+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?/);
     return match?.[0];
 }
-export function _getClaudeVersionInvocation(binaryPath, platform = platformImpl(), comspec = comspecImpl()) {
+export function _getClaudeVersionInvocation(binaryPath, platform = platformImpl(), windowsCmd = windowsCmdImpl()) {
     const ext = path.extname(binaryPath).toLowerCase();
     if (platform === 'win32' && (ext === '.cmd' || ext === '.bat')) {
         const command = [quoteForCmd(binaryPath), '--version'].join(' ');
         return {
-            file: comspec || 'cmd.exe',
+            file: windowsCmd,
             args: ['/d', '/s', '/c', `"${command}"`],
         };
     }
@@ -156,9 +158,15 @@ export async function getClaudeCodeVersion() {
     const diskCache = readVersionCache(homeDir);
     if (diskCache) {
         const cachedBinaryInfo = statResolvedBinary(diskCache.binaryPath);
+        const resolvedBinaryCandidate = resolveClaudeBinaryImpl();
+        const currentResolvedBinary = resolvedBinaryCandidate
+            ? (statResolvedBinary(resolvedBinaryCandidate.path) ?? resolvedBinaryCandidate)
+            : null;
         if (cachedBinaryInfo
             && cachedBinaryInfo.path === diskCache.binaryPath
-            && cachedBinaryInfo.mtimeMs === diskCache.binaryMtimeMs) {
+            && cachedBinaryInfo.mtimeMs === diskCache.binaryMtimeMs
+            && currentResolvedBinary
+            && currentResolvedBinary.path === diskCache.binaryPath) {
             const cachedKey = getBinaryCacheKey(cachedBinaryInfo);
             if (hasResolved && cachedBinaryKey === cachedKey) {
                 return cachedVersion;
@@ -192,6 +200,7 @@ export async function getClaudeCodeVersion() {
         cachedVersion = undefined;
     }
     writeVersionCache(homeDir, {
+        resolvedFromPath: resolvedBinaryInfo.path,
         binaryPath: binaryInfo.path,
         binaryMtimeMs: binaryInfo.mtimeMs,
         version: cachedVersion ?? null,
@@ -211,8 +220,8 @@ export function _setExecFileImplForTests(impl) {
 export function _setResolveClaudeBinaryForTests(impl) {
     resolveClaudeBinaryImpl = impl ?? resolveClaudeBinaryFromPath;
 }
-export function _setVersionInvocationEnvForTests(platformGetter, comspecGetter) {
+export function _setVersionInvocationEnvForTests(platformGetter, windowsCmdGetter) {
     platformImpl = platformGetter ?? (() => process.platform);
-    comspecImpl = comspecGetter ?? (() => process.env.COMSPEC);
+    windowsCmdImpl = windowsCmdGetter ?? (() => 'C:\\Windows\\System32\\cmd.exe');
 }
 //# sourceMappingURL=version.js.map

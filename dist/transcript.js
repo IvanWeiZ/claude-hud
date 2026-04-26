@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import * as readline from 'readline';
 import { createHash } from 'node:crypto';
 import { getHudPluginDir } from './claude-config-dir.js';
+const TRANSCRIPT_CACHE_VERSION = 3;
 let createReadStreamImpl = fs.createReadStream;
 function normalizeTokenCount(value) {
     if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -26,6 +27,14 @@ function normalizeSessionTokens(tokens) {
 function getTranscriptCachePath(transcriptPath, homeDir) {
     const hash = createHash('sha256').update(path.resolve(transcriptPath)).digest('hex');
     return path.join(getHudPluginDir(homeDir), 'transcript-cache', `${hash}.json`);
+}
+function canonicalizeTranscriptPath(transcriptPath) {
+    try {
+        return fs.realpathSync(transcriptPath);
+    }
+    catch {
+        return null;
+    }
 }
 function readTranscriptFileState(transcriptPath) {
     try {
@@ -57,7 +66,10 @@ function serializeTranscriptData(data) {
         todos: data.todos.map((todo) => ({ ...todo })),
         sessionStart: data.sessionStart?.toISOString(),
         sessionName: data.sessionName,
+        lastAssistantResponseAt: data.lastAssistantResponseAt?.toISOString(),
         sessionTokens: data.sessionTokens,
+        lastCompactBoundaryAt: data.lastCompactBoundaryAt?.toISOString(),
+        lastCompactPostTokens: data.lastCompactPostTokens,
     };
 }
 function deserializeTranscriptData(data) {
@@ -75,7 +87,10 @@ function deserializeTranscriptData(data) {
         todos: data.todos.map((todo) => ({ ...todo })),
         sessionStart: data.sessionStart ? new Date(data.sessionStart) : undefined,
         sessionName: data.sessionName,
+        lastAssistantResponseAt: data.lastAssistantResponseAt ? new Date(data.lastAssistantResponseAt) : undefined,
         sessionTokens: normalizeSessionTokens(data.sessionTokens),
+        lastCompactBoundaryAt: data.lastCompactBoundaryAt ? new Date(data.lastCompactBoundaryAt) : undefined,
+        lastCompactPostTokens: typeof data.lastCompactPostTokens === 'number' ? data.lastCompactPostTokens : undefined,
     };
 }
 function readTranscriptCache(transcriptPath, state) {
@@ -83,7 +98,10 @@ function readTranscriptCache(transcriptPath, state) {
         const cachePath = getTranscriptCachePath(transcriptPath, os.homedir());
         const raw = fs.readFileSync(cachePath, 'utf8');
         const parsed = JSON.parse(raw);
-        if (parsed.transcriptPath !== path.resolve(transcriptPath)
+        if (parsed.version !== TRANSCRIPT_CACHE_VERSION
+            || !parsed.data
+            || !parsed.transcriptPath
+            || parsed.transcriptPath !== path.resolve(transcriptPath)
             || parsed.transcriptState?.mtimeMs !== state.mtimeMs
             || parsed.transcriptState?.size !== state.size) {
             return null;
@@ -99,11 +117,12 @@ function writeTranscriptCache(transcriptPath, state, data) {
         const cachePath = getTranscriptCachePath(transcriptPath, os.homedir());
         fs.mkdirSync(path.dirname(cachePath), { recursive: true });
         const payload = {
+            version: TRANSCRIPT_CACHE_VERSION,
             transcriptPath: path.resolve(transcriptPath),
             transcriptState: state,
             data: serializeTranscriptData(data),
         };
-        fs.writeFileSync(cachePath, JSON.stringify(payload), 'utf8');
+        fs.writeFileSync(cachePath, JSON.stringify(payload), { encoding: 'utf8', mode: 0o600 });
     }
     catch {
         // Cache failures are non-fatal; fall back to fresh parsing next time.
@@ -118,11 +137,15 @@ export async function parseTranscript(transcriptPath) {
     if (!transcriptPath || !fs.existsSync(transcriptPath)) {
         return result;
     }
-    const transcriptState = readTranscriptFileState(transcriptPath);
+    const canonicalTranscriptPath = canonicalizeTranscriptPath(transcriptPath);
+    if (!canonicalTranscriptPath) {
+        return result;
+    }
+    const transcriptState = readTranscriptFileState(canonicalTranscriptPath);
     if (!transcriptState) {
         return result;
     }
-    const cached = readTranscriptCache(transcriptPath, transcriptState);
+    const cached = readTranscriptCache(canonicalTranscriptPath, transcriptState);
     if (cached) {
         return cached;
     }
@@ -132,6 +155,8 @@ export async function parseTranscript(transcriptPath) {
     const taskIdToIndex = new Map();
     let latestSlug;
     let customTitle;
+    let lastCompactBoundaryAt;
+    let lastCompactPostTokens;
     const sessionTokens = {
         inputTokens: 0,
         outputTokens: 0,
@@ -140,7 +165,7 @@ export async function parseTranscript(transcriptPath) {
     };
     let parsedCleanly = false;
     try {
-        const fileStream = createReadStreamImpl(transcriptPath);
+        const fileStream = createReadStreamImpl(canonicalTranscriptPath);
         const rl = readline.createInterface({
             input: fileStream,
             crlfDelay: Infinity,
@@ -164,6 +189,22 @@ export async function parseTranscript(transcriptPath) {
                     sessionTokens.cacheCreationTokens += normalizeTokenCount(usage.cache_creation_input_tokens);
                     sessionTokens.cacheReadTokens += normalizeTokenCount(usage.cache_read_input_tokens);
                 }
+                // Track Claude Code's compact_boundary marker. Both manual (/compact)
+                // and auto compaction emit this system entry with compactMetadata; we
+                // take the most recent one's timestamp so callers can distinguish a
+                // legitimate post-compact zero frame from a transient stdin glitch.
+                if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+                    const ts = entry.timestamp ? new Date(entry.timestamp) : null;
+                    if (ts && !Number.isNaN(ts.getTime())) {
+                        if (!lastCompactBoundaryAt || ts.getTime() > lastCompactBoundaryAt.getTime()) {
+                            lastCompactBoundaryAt = ts;
+                            const post = entry.compactMetadata?.postTokens;
+                            lastCompactPostTokens = typeof post === 'number' && Number.isFinite(post) && post >= 0
+                                ? Math.trunc(post)
+                                : undefined;
+                        }
+                    }
+                }
                 processEntry(entry, toolMap, agentMap, taskIdToIndex, latestTodos, result);
             }
             catch {
@@ -180,8 +221,10 @@ export async function parseTranscript(transcriptPath) {
     result.todos = latestTodos;
     result.sessionName = customTitle ?? latestSlug;
     result.sessionTokens = sessionTokens;
+    result.lastCompactBoundaryAt = lastCompactBoundaryAt;
+    result.lastCompactPostTokens = lastCompactPostTokens;
     if (parsedCleanly) {
-        writeTranscriptCache(transcriptPath, transcriptState, result);
+        writeTranscriptCache(canonicalTranscriptPath, transcriptState, result);
     }
     return result;
 }
@@ -190,8 +233,12 @@ export function _setCreateReadStreamForTests(impl) {
 }
 function processEntry(entry, toolMap, agentMap, taskIdToIndex, latestTodos, result) {
     const timestamp = entry.timestamp ? new Date(entry.timestamp) : new Date();
-    if (!result.sessionStart && entry.timestamp) {
+    const hasValidTimestamp = !Number.isNaN(timestamp.getTime());
+    if (!result.sessionStart && entry.timestamp && hasValidTimestamp) {
         result.sessionStart = timestamp;
+    }
+    if (entry.type === 'assistant' && entry.timestamp && hasValidTimestamp) {
+        result.lastAssistantResponseAt = timestamp;
     }
     const content = entry.message?.content;
     if (!content || !Array.isArray(content))
@@ -220,27 +267,37 @@ function processEntry(entry, toolMap, agentMap, taskIdToIndex, latestTodos, resu
             else if (block.name === 'TodoWrite') {
                 const input = block.input;
                 if (input?.todos && Array.isArray(input.todos)) {
-                    // Build reverse map: content → taskIds from existing state
+                    // Build a FIFO queue of taskIds per content string, ordered by the
+                    // old array position. Two todos that share the same content must
+                    // each get their own taskId back after the rebuild, so we cannot
+                    // collapse duplicates to one index.
                     const contentToTaskIds = new Map();
+                    const taskIdsByOldIndex = [];
                     for (const [taskId, idx] of taskIdToIndex) {
                         if (idx < latestTodos.length) {
-                            const content = latestTodos[idx].content;
-                            const ids = contentToTaskIds.get(content) ?? [];
-                            ids.push(taskId);
-                            contentToTaskIds.set(content, ids);
+                            taskIdsByOldIndex.push([idx, taskId]);
                         }
+                    }
+                    taskIdsByOldIndex.sort((a, b) => a[0] - b[0]);
+                    for (const [idx, taskId] of taskIdsByOldIndex) {
+                        const content = latestTodos[idx].content;
+                        const ids = contentToTaskIds.get(content) ?? [];
+                        ids.push(taskId);
+                        contentToTaskIds.set(content, ids);
                     }
                     latestTodos.length = 0;
                     taskIdToIndex.clear();
                     latestTodos.push(...input.todos);
-                    // Re-register taskId mappings for items whose content matches
+                    // Consume one queued taskId per new todo that matches by content,
+                    // so duplicate-content items still each get their own taskId.
                     for (let i = 0; i < latestTodos.length; i++) {
                         const ids = contentToTaskIds.get(latestTodos[i].content);
-                        if (ids) {
-                            for (const taskId of ids) {
-                                taskIdToIndex.set(taskId, i);
+                        if (ids && ids.length > 0) {
+                            const taskId = ids.shift();
+                            taskIdToIndex.set(taskId, i);
+                            if (ids.length === 0) {
+                                contentToTaskIds.delete(latestTodos[i].content);
                             }
-                            contentToTaskIds.delete(latestTodos[i].content);
                         }
                     }
                 }
@@ -306,6 +363,10 @@ function extractTarget(toolName, input) {
             return input.pattern;
         case 'Grep':
             return input.pattern;
+        case 'Skill':
+            return typeof input.skill === 'string' && input.skill.trim().length > 0
+                ? input.skill
+                : undefined;
         case 'Bash':
             const cmd = input.command;
             return cmd?.slice(0, 30) + (cmd?.length > 30 ? '...' : '');
